@@ -1,0 +1,101 @@
+(ns johanwiren.re-tiny.alpha
+  (:require ["dart:developer" :as dev]
+            ["dart:async" :as a]))
+
+(defonce chan (atom nil))
+(defonce db (atom {}))
+
+(defprotocol Channel
+  (subscribe [x handler])
+  (put! [x event]))
+
+(defprotocol Interceptor
+  (interceptor [x]))
+
+(extend-protocol Interceptor
+  Function
+  (interceptor [f] {:enter f
+                    :name (str f)})
+
+  Map
+  (interceptor [x] x))
+
+(defn dispatch [event]
+  (put! @chan event))
+
+(def db-i {:name :db
+           :enter (fn [ctx] (assoc ctx :db @db))
+           :leave (fn [{new-db :db :as ctx}]
+                    (when (and new-db (not= new-db db))
+                      (reset! db new-db))
+                    ctx)})
+
+(def dispatch-i {:name :dispatch
+                 :enter (fn [ctx]
+                          (assoc ctx :dispatch []))
+                 :leave (fn [{events :dispatch
+                              :as ctx}]
+                          (run! dispatch events)
+                          ctx)})
+
+(def fx-i {:name :fx
+           :enter (fn [ctx]
+                    (assoc ctx :fx []))
+           :leave (fn [{:keys [fx] :as ctx}]
+                    (run! (fn [[f arg]] (f arg)) fx)
+                    ctx)})
+
+(def interceptors [db-i dispatch-i fx-i])
+
+(defn leave-step [{::keys [stack] :as ctx}]
+  (if-let [{:keys [leave] :as intrcptr} (peek stack)]
+    (-> ctx
+        (update ::queue conj intrcptr)
+        (update ::stack pop)
+        (cond-> leave
+          (leave))
+        #?(:cljd await)
+        (recur))
+    ctx))
+
+(defn enter-step [{::keys [queue] :as ctx}]
+  (if-let [{:keys [enter] :as intrcptr} (peek queue)]
+    (-> ctx
+        (update ::queue pop)
+        (update ::stack conj intrcptr)
+        (cond-> enter
+          (enter))
+        #?(:cljd await)
+        (recur))
+    ctx))
+
+(defn execute [ctx interceptors]
+  (-> (assoc ctx
+             ::queue (apply list interceptors)
+             ::stack (list))
+      enter-step
+      #?(:cljd await)
+      leave-step
+      #?(:cljd await)))
+
+(defn handle-event [[event-handler data]]
+  (let [{:keys [debug] :as i} (interceptor event-handler)
+        interceptors (into interceptors
+                           (conj (:interceptors i [])
+                                 (assoc i :enter (fn [ctx]
+                                                   ((:enter i) ctx data)))))]
+    (dev/log (str [:dispatch [(:name i) data]]))
+    (-> (execute {:debug debug} interceptors)
+        #?(:cljd await))))
+
+(defn init! []
+  (let [ctrl (a/StreamController)
+        stream (.-stream ctrl)
+        init-chan (reify Channel
+                    (put! [_ event]
+                      (.add ctrl event))
+                    (subscribe [_ f]
+                      (.listen stream (fn [x] (f x) nil) .cancelOnError true)))]
+    (reset! chan init-chan)
+    (subscribe init-chan handle-event)))
+
